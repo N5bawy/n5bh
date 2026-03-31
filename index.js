@@ -10,7 +10,8 @@ const {
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  WebhookClient
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
@@ -27,8 +28,17 @@ const VIDEO_ROOM = "1477417977472090316";
 const LEADERBOARD_CHANNEL_ID = "1484809257361870892";
 const LEADERBOARD_ROLE_ID = "1426999940944756889";
 
-/* ✅ تحديث تلقائي كل 5 ثواني */
+/* ✅ تحديث تلقائي */
 const LEADERBOARD_UPDATE_INTERVAL = 5000;
+const SERVER_STATUS_UPDATE_INTERVAL = 60000;
+
+/* ✅ Webhook جديد */
+const SERVER_STATUS_WEBHOOK_URL = "https://discord.com/api/webhooks/1488564259838230688/P1DVnLUT5boXJfDFT0plOMFBrTj8yCdaXj--FJ3_6LhbpHjjRzK29GtZgxdqPe5XDMTT";
+
+/* ✅ FiveM */
+const FIVEM_SERVER_NAME = "N5BH Server";
+const FIVEM_ENDPOINT = "http://10.146.225.27:30120";
+const FIVEM_F8_CONNECT = "connect 10.146.225.27:30120";
 
 /* ✅ حالة النظام */
 let mediaOnlyEnabled = true;
@@ -54,9 +64,11 @@ const DATA_FILE = path.join(DATA_DIR, "bot-data.json");
 
 let saveTimeout = null;
 let leaderboardInterval = null;
+let statusInterval = null;
 let leaderboardUpdating = false;
 
 const activeVoiceSessions = new Map();
+const serverStatusWebhook = new WebhookClient({ url: SERVER_STATUS_WEBHOOK_URL });
 
 const db = {
   warnings: {},
@@ -64,6 +76,9 @@ const db = {
     channelId: LEADERBOARD_CHANNEL_ID,
     messageId: null,
     users: {}
+  },
+  serverStatus: {
+    messageId: null
   }
 };
 
@@ -90,6 +105,9 @@ function loadDatabase() {
       channelId: parsed.leaderboard?.channelId || LEADERBOARD_CHANNEL_ID,
       messageId: parsed.leaderboard?.messageId || null,
       users: parsed.leaderboard?.users || {}
+    };
+    db.serverStatus = {
+      messageId: parsed.serverStatus?.messageId || null
     };
   } catch (error) {
     console.error("❌ Failed to load database:", error);
@@ -355,6 +373,115 @@ async function updateLeaderboardMessage(guild) {
   }
 }
 
+async function fetchFiveMServerStatus() {
+  try {
+    const [playersRes, infoRes] = await Promise.all([
+      fetch(`${FIVEM_ENDPOINT}/players.json`),
+      fetch(`${FIVEM_ENDPOINT}/info.json`)
+    ]);
+
+    if (!playersRes.ok || !infoRes.ok) {
+      throw new Error("Failed to fetch FiveM status");
+    }
+
+    const players = await playersRes.json();
+    const info = await infoRes.json();
+
+    const maxPlayers =
+      info.vars?.sv_maxClients ||
+      info.vars?.sv_maxclients ||
+      info.vars?.["sv_maxClients"] ||
+      "Unknown";
+
+    return {
+      online: true,
+      players: Array.isArray(players) ? players.length : 0,
+      maxPlayers
+    };
+  } catch {
+    return {
+      online: false,
+      players: 0,
+      maxPlayers: "Unknown"
+    };
+  }
+}
+
+function buildServerStatusEmbed(status) {
+  return new EmbedBuilder()
+    .setColor(status.online ? "#00ff99" : "#ff3b30")
+    .setTitle(FIVEM_SERVER_NAME)
+    .setDescription("Live FiveM Server Status")
+    .addFields(
+      {
+        name: "🟢 STATUS",
+        value: status.online ? "Online" : "Offline",
+        inline: true
+      },
+      {
+        name: "👥 PLAYERS",
+        value: `${status.players}/${status.maxPlayers}`,
+        inline: true
+      },
+      {
+        name: "🎮 F8 CONNECT",
+        value: `\`${FIVEM_F8_CONNECT}\``,
+        inline: false
+      }
+    )
+    .setFooter({
+      text: "Updated automatically every 60 seconds"
+    })
+    .setTimestamp();
+}
+
+async function ensureServerStatusMessage() {
+  const status = await fetchFiveMServerStatus();
+  const embed = buildServerStatusEmbed(status);
+
+  if (db.serverStatus.messageId) {
+    try {
+      await serverStatusWebhook.editMessage(db.serverStatus.messageId, {
+        embeds: [embed]
+      });
+      return;
+    } catch {
+      db.serverStatus.messageId = null;
+      saveDatabase();
+    }
+  }
+
+  const message = await serverStatusWebhook.send({
+    embeds: [embed]
+  });
+
+  db.serverStatus.messageId = message.id;
+  saveDatabase();
+}
+
+async function updateServerStatusMessage() {
+  try {
+    const status = await fetchFiveMServerStatus();
+    const embed = buildServerStatusEmbed(status);
+
+    if (!db.serverStatus.messageId) {
+      const message = await serverStatusWebhook.send({
+        embeds: [embed]
+      });
+
+      db.serverStatus.messageId = message.id;
+      saveDatabase();
+      return;
+    }
+
+    await serverStatusWebhook.editMessage(db.serverStatus.messageId, {
+      embeds: [embed]
+    });
+  } catch (error) {
+    console.error("❌ Failed to update server status message:", error);
+  }
+}
+
 function hasLeaderboardRole(member) {
   return member.roles.cache.has(LEADERBOARD_ROLE_ID);
 }
@@ -495,11 +622,17 @@ client.once("clientReady", async () => {
 
   await ensureLeaderboardMessage(guild);
   await updateLeaderboardMessage(guild);
+  await ensureServerStatusMessage();
 
   if (leaderboardInterval) clearInterval(leaderboardInterval);
   leaderboardInterval = setInterval(() => {
     updateLeaderboardMessage(guild).catch(() => {});
   }, LEADERBOARD_UPDATE_INTERVAL);
+
+  if (statusInterval) clearInterval(statusInterval);
+  statusInterval = setInterval(() => {
+    updateServerStatusMessage().catch(() => {});
+  }, SERVER_STATUS_UPDATE_INTERVAL);
 });
 
 client.on("messageCreate", async message => {
