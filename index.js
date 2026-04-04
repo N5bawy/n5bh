@@ -10,7 +10,9 @@ const {
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonStyle
+  ButtonStyle,
+  PermissionsBitField,
+  ChannelType
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
@@ -60,6 +62,7 @@ const activeVoiceSessions = new Map();
 
 const db = {
   warnings: {},
+  blacklist: {},
   leaderboard: {
     channelId: LEADERBOARD_CHANNEL_ID,
     messageId: null,
@@ -86,6 +89,7 @@ function loadDatabase() {
     const parsed = JSON.parse(raw);
 
     db.warnings = parsed.warnings || {};
+    db.blacklist = parsed.blacklist || {};
     db.leaderboard = {
       channelId: parsed.leaderboard?.channelId || LEADERBOARD_CHANNEL_ID,
       messageId: parsed.leaderboard?.messageId || null,
@@ -321,6 +325,7 @@ async function ensureLeaderboardMessage(guild) {
 
   db.leaderboard.messageId = newMessage.id;
   saveDatabase();
+
   return newMessage;
 }
 
@@ -359,6 +364,30 @@ function hasLeaderboardRole(member) {
   return member.roles.cache.has(LEADERBOARD_ROLE_ID);
 }
 
+function hasAdmin(member) {
+  return member.permissions.has(PermissionsBitField.Flags.Administrator);
+}
+
+function hasManageChannels(member) {
+  return member.permissions.has(PermissionsBitField.Flags.ManageChannels) || hasAdmin(member);
+}
+
+function hasModeration(member) {
+  return (
+    member.permissions.has(PermissionsBitField.Flags.KickMembers) ||
+    member.permissions.has(PermissionsBitField.Flags.BanMembers) ||
+    member.permissions.has(PermissionsBitField.Flags.ModerateMembers) ||
+    hasAdmin(member)
+  );
+}
+
+function denyReply(interaction) {
+  return interaction.reply({
+    content: "❌ لا يمكنك استخدام الأمر",
+    ephemeral: true
+  });
+}
+
 function warningMapGet(userId) {
   return db.warnings[userId] || null;
 }
@@ -373,6 +402,20 @@ function warningMapDelete(userId) {
   scheduleSave();
 }
 
+function blacklistGet(userId) {
+  return db.blacklist[userId] || null;
+}
+
+function blacklistSet(userId, value) {
+  db.blacklist[userId] = value;
+  scheduleSave();
+}
+
+function blacklistDelete(userId) {
+  delete db.blacklist[userId];
+  scheduleSave();
+}
+
 function sendLog(interaction, channelId, embed, row) {
   const channel = interaction.guild.channels.cache.get(channelId);
 
@@ -381,6 +424,62 @@ function sendLog(interaction, channelId, embed, row) {
       embeds: [embed],
       components: row ? [row] : []
     }).catch(() => {});
+  }
+}
+
+function parseChannelIds(input) {
+  return input
+    .split(",")
+    .map(x => x.trim().replace(/[<#>]/g, ""))
+    .filter(Boolean);
+}
+
+async function setRoleViewForChannel(channel, roleId, visible) {
+  await channel.permissionOverwrites.edit(roleId, {
+    ViewChannel: visible ? true : false
+  }).catch(() => {});
+}
+
+async function setRoleSendForChannel(channel, roleId, allowed) {
+  if (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement) {
+    await channel.permissionOverwrites.edit(roleId, {
+      SendMessages: allowed ? true : false
+    }).catch(() => {});
+  }
+}
+
+async function setRoleConnectForChannel(channel, roleId, allowed) {
+  if (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice) {
+    await channel.permissionOverwrites.edit(roleId, {
+      Connect: allowed ? true : false,
+      Speak: allowed ? true : false
+    }).catch(() => {});
+  }
+}
+
+async function applyActionToChannel(channel, roleId, action) {
+  if (action === "hide") {
+    await setRoleViewForChannel(channel, roleId, false);
+  }
+
+  if (action === "show") {
+    await setRoleViewForChannel(channel, roleId, true);
+  }
+
+  if (action === "deny_send") {
+    await setRoleSendForChannel(channel, roleId, false);
+  }
+
+  if (action === "allow_send") {
+    await setRoleSendForChannel(channel, roleId, true);
+  }
+
+  if (action === "deny_connect") {
+    await setRoleConnectForChannel(channel, roleId, false);
+  }
+
+  if (action === "allow_connect") {
+    await setRoleConnectForChannel(channel, roleId, true);
   }
 }
 
@@ -456,7 +555,99 @@ const commands = [
       o.setName("user")
         .setDescription("عضو معين لعرض احصائياته")
         .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("kick")
+    .setDescription("طرد عضو")
+    .addUserOption(o => o.setName("user").setDescription("العضو").setRequired(true))
+    .addStringOption(o => o.setName("reason").setDescription("السبب").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("ban")
+    .setDescription("باند عضو")
+    .addUserOption(o => o.setName("user").setDescription("العضو").setRequired(true))
+    .addStringOption(o => o.setName("reason").setDescription("السبب").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("timeout")
+    .setDescription("تايم اوت عضو")
+    .addUserOption(o => o.setName("user").setDescription("العضو").setRequired(true))
+    .addIntegerOption(o => o.setName("minutes").setDescription("عدد الدقائق").setRequired(true))
+    .addStringOption(o => o.setName("reason").setDescription("السبب").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("untimeout")
+    .setDescription("إزالة التايم اوت")
+    .addUserOption(o => o.setName("user").setDescription("العضو").setRequired(true))
+    .addStringOption(o => o.setName("reason").setDescription("السبب").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("purge")
+    .setDescription("حذف رسائل")
+    .addIntegerOption(o => o.setName("amount").setDescription("العدد").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("categoryhide")
+    .setDescription("إخفاء كاتاقوري كاملة من رتبة")
+    .addRoleOption(o => o.setName("role").setDescription("الرتبة").setRequired(true))
+    .addChannelOption(o => o.setName("category").setDescription("الكاتاقوري").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("categoryshow")
+    .setDescription("إظهار كاتاقوري كاملة لرتبة")
+    .addRoleOption(o => o.setName("role").setDescription("الرتبة").setRequired(true))
+    .addChannelOption(o => o.setName("category").setDescription("الكاتاقوري").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("channelhide")
+    .setDescription("إخفاء روم من رتبة")
+    .addRoleOption(o => o.setName("role").setDescription("الرتبة").setRequired(true))
+    .addChannelOption(o => o.setName("channel").setDescription("الروم").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("channelshow")
+    .setDescription("إظهار روم لرتبة")
+    .addRoleOption(o => o.setName("role").setDescription("الرتبة").setRequired(true))
+    .addChannelOption(o => o.setName("channel").setDescription("الروم").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("channelset")
+    .setDescription("تعديل عدة رومات لرتبة معينة")
+    .addRoleOption(o => o.setName("role").setDescription("الرتبة").setRequired(true))
+    .addStringOption(o =>
+      o.setName("channel_ids")
+        .setDescription("ايديات الرومات مفصولة بفواصل")
+        .setRequired(true)
     )
+    .addStringOption(o =>
+      o.setName("action")
+        .setDescription("نوع التعديل")
+        .setRequired(true)
+        .addChoices(
+          { name: "Hide", value: "hide" },
+          { name: "Show", value: "show" },
+          { name: "Deny Send", value: "deny_send" },
+          { name: "Allow Send", value: "allow_send" },
+          { name: "Deny Connect", value: "deny_connect" },
+          { name: "Allow Connect", value: "allow_connect" }
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName("blacklist")
+    .setDescription("إضافة شخص للبلاك ليست بالايدي")
+    .addStringOption(o => o.setName("id").setDescription("ايدي الشخص").setRequired(true))
+    .addStringOption(o => o.setName("reason").setDescription("السبب").setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName("unblacklist")
+    .setDescription("إزالة شخص من البلاك ليست")
+    .addStringOption(o => o.setName("id").setDescription("ايدي الشخص").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("blacklistlist")
+    .setDescription("عرض قائمة البلاك ليست")
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -500,6 +691,15 @@ client.once("clientReady", async () => {
   leaderboardInterval = setInterval(() => {
     updateLeaderboardMessage(guild).catch(() => {});
   }, LEADERBOARD_UPDATE_INTERVAL);
+});
+
+client.on("guildMemberAdd", async member => {
+  if (member.guild.id !== GUILD_ID) return;
+
+  const blacklisted = blacklistGet(member.id);
+  if (!blacklisted) return;
+
+  await member.kick(`Blacklisted: ${blacklisted.reason || "No reason"}`).catch(() => {});
 });
 
 client.on("messageCreate", async message => {
@@ -637,6 +837,233 @@ client.on("interactionCreate", async interaction => {
         ephemeral: true
       });
     }
+  }
+
+  if (interaction.commandName === "kick") {
+    if (!hasModeration(interaction.member)) return denyReply(interaction);
+
+    const target = interaction.options.getMember("user");
+    const reason = interaction.options.getString("reason") || "No reason";
+
+    if (!target) {
+      return interaction.reply({ content: "❌ ما قدرت أحدد العضو.", ephemeral: true });
+    }
+
+    await target.kick(reason).catch(() => {});
+
+    return interaction.reply({
+      content: `✅ تم طرد ${target.user.tag}`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "ban") {
+    if (!hasModeration(interaction.member)) return denyReply(interaction);
+
+    const target = interaction.options.getUser("user");
+    const reason = interaction.options.getString("reason") || "No reason";
+
+    await interaction.guild.members.ban(target.id, { reason }).catch(() => {});
+
+    return interaction.reply({
+      content: `✅ تم باند ${target.tag}`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "timeout") {
+    if (!hasModeration(interaction.member)) return denyReply(interaction);
+
+    const target = interaction.options.getMember("user");
+    const minutes = interaction.options.getInteger("minutes");
+    const reason = interaction.options.getString("reason") || "No reason";
+
+    if (!target) {
+      return interaction.reply({ content: "❌ ما قدرت أحدد العضو.", ephemeral: true });
+    }
+
+    await target.timeout(minutes * 60 * 1000, reason).catch(() => {});
+
+    return interaction.reply({
+      content: `✅ تم تايم اوت ${target.user.tag} لمدة ${minutes} دقيقة`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "untimeout") {
+    if (!hasModeration(interaction.member)) return denyReply(interaction);
+
+    const target = interaction.options.getMember("user");
+    const reason = interaction.options.getString("reason") || "No reason";
+
+    if (!target) {
+      return interaction.reply({ content: "❌ ما قدرت أحدد العضو.", ephemeral: true });
+    }
+
+    await target.timeout(null, reason).catch(() => {});
+
+    return interaction.reply({
+      content: `✅ تم فك التايم اوت عن ${target.user.tag}`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "purge") {
+    if (!hasModeration(interaction.member)) return denyReply(interaction);
+
+    const amount = interaction.options.getInteger("amount");
+
+    if (amount < 1 || amount > 100) {
+      return interaction.reply({
+        content: "❌ العدد لازم يكون بين 1 و 100",
+        ephemeral: true
+      });
+    }
+
+    await interaction.channel.bulkDelete(amount, true).catch(() => {});
+
+    return interaction.reply({
+      content: `✅ تم حذف ${amount} رسالة`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "categoryhide" || interaction.commandName === "categoryshow") {
+    if (!hasManageChannels(interaction.member)) return denyReply(interaction);
+
+    const role = interaction.options.getRole("role");
+    const category = interaction.options.getChannel("category");
+
+    if (!category || category.type !== ChannelType.GuildCategory) {
+      return interaction.reply({
+        content: "❌ لازم تختار كاتاقوري صحيحة",
+        ephemeral: true
+      });
+    }
+
+    const visible = interaction.commandName === "categoryshow";
+
+    await setRoleViewForChannel(category, role.id, visible);
+
+    const children = interaction.guild.channels.cache.filter(ch => ch.parentId === category.id);
+    for (const [, child] of children) {
+      await setRoleViewForChannel(child, role.id, visible);
+    }
+
+    return interaction.reply({
+      content: visible
+        ? `✅ تم إظهار الكاتاقوري ${category.name} للرتبة ${role.name}`
+        : `✅ تم إخفاء الكاتاقوري ${category.name} عن الرتبة ${role.name}`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "channelhide" || interaction.commandName === "channelshow") {
+    if (!hasManageChannels(interaction.member)) return denyReply(interaction);
+
+    const role = interaction.options.getRole("role");
+    const channel = interaction.options.getChannel("channel");
+    const visible = interaction.commandName === "channelshow";
+
+    await setRoleViewForChannel(channel, role.id, visible);
+
+    return interaction.reply({
+      content: visible
+        ? `✅ تم إظهار الروم ${channel.name} للرتبة ${role.name}`
+        : `✅ تم إخفاء الروم ${channel.name} عن الرتبة ${role.name}`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "channelset") {
+    if (!hasManageChannels(interaction.member)) return denyReply(interaction);
+
+    const role = interaction.options.getRole("role");
+    const ids = parseChannelIds(interaction.options.getString("channel_ids"));
+    const action = interaction.options.getString("action");
+
+    let done = 0;
+    let failed = 0;
+
+    for (const id of ids) {
+      const channel = interaction.guild.channels.cache.get(id);
+      if (!channel) {
+        failed++;
+        continue;
+      }
+
+      await applyActionToChannel(channel, role.id, action).catch(() => {});
+      done++;
+    }
+
+    return interaction.reply({
+      content: `✅ تم التنفيذ على ${done} روم${failed ? ` | فشل: ${failed}` : ""}`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "blacklist") {
+    if (!hasAdmin(interaction.member)) return denyReply(interaction);
+
+    const targetId = interaction.options.getString("id").trim();
+    const reason = interaction.options.getString("reason") || "No reason";
+
+    blacklistSet(targetId, {
+      id: targetId,
+      reason,
+      by: user.id,
+      at: Date.now()
+    });
+
+    const member = await interaction.guild.members.fetch(targetId).catch(() => null);
+    if (member) {
+      await member.kick(`Blacklisted: ${reason}`).catch(() => {});
+    }
+
+    return interaction.reply({
+      content: `✅ تم إضافة ${targetId} للبلاك ليست`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "unblacklist") {
+    if (!hasAdmin(interaction.member)) return denyReply(interaction);
+
+    const targetId = interaction.options.getString("id").trim();
+    blacklistDelete(targetId);
+
+    return interaction.reply({
+      content: `✅ تم إزالة ${targetId} من البلاك ليست`,
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "blacklistlist") {
+    if (!hasAdmin(interaction.member)) return denyReply(interaction);
+
+    const entries = Object.values(db.blacklist);
+
+    if (!entries.length) {
+      return interaction.reply({
+        content: "لا يوجد أحد في البلاك ليست",
+        ephemeral: true
+      });
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor("#8b0000")
+      .setTitle("Blacklist List")
+      .setDescription(
+        entries
+          .map((entry, index) => `**#${index + 1}** \`${entry.id}\` | ${entry.reason}`)
+          .join("\n")
+      )
+      .setTimestamp();
+
+    return interaction.reply({
+      embeds: [embed],
+      ephemeral: true
+    });
   }
 
   if (interaction.commandName === "send") {
