@@ -36,6 +36,16 @@ const LEADERBOARD_ROLE_ID = "1426999940944756889";
 /* ✅ تحديث تلقائي كل 5 ثواني */
 const LEADERBOARD_UPDATE_INTERVAL = 5000;
 
+/* ✅ Self Mute AFK System */
+const SELF_MUTE_AFK_CHANNEL_ID = "1371119823437824111";
+const SELF_MUTE_EXEMPT_CHANNEL_IDS = [
+  "1371119823437824111"
+];
+const SELF_MUTE_MOVE_DELAY_MS = 60 * 60 * 1000;
+
+const selfMuteTimers = new Map();
+const selfMuteStartedAt = new Map();
+
 /* ✅ حالة النظام */
 let mediaOnlyEnabled = true;
 
@@ -590,6 +600,96 @@ async function applyActionToChannel(channel, roleId, action) {
   }
 }
 
+function isExcludedSelfMuteChannel(channelId) {
+  return SELF_MUTE_EXEMPT_CHANNEL_IDS.includes(channelId);
+}
+
+function clearSelfMuteTracking(userId) {
+  const existing = selfMuteTimers.get(userId);
+  if (existing) {
+    clearTimeout(existing);
+  }
+
+  selfMuteTimers.delete(userId);
+  selfMuteStartedAt.delete(userId);
+}
+
+function armSelfMuteTimer(member) {
+  const userId = member.id;
+  const startedAt = selfMuteStartedAt.get(userId) || Date.now();
+
+  selfMuteStartedAt.set(userId, startedAt);
+
+  const elapsed = Date.now() - startedAt;
+  const remaining = Math.max(1000, SELF_MUTE_MOVE_DELAY_MS - elapsed);
+
+  const existing = selfMuteTimers.get(userId);
+  if (existing) {
+    clearTimeout(existing);
+  }
+
+  const timer = setTimeout(async () => {
+    try {
+      const guild = client.guilds.cache.get(GUILD_ID);
+      if (!guild) {
+        clearSelfMuteTracking(userId);
+        return;
+      }
+
+      const refreshedMember = await guild.members.fetch(userId).catch(() => null);
+      if (!refreshedMember || !refreshedMember.voice) {
+        clearSelfMuteTracking(userId);
+        return;
+      }
+
+      const voiceState = refreshedMember.voice;
+
+      if (
+        !voiceState.channelId ||
+        !voiceState.selfMute ||
+        voiceState.channelId === SELF_MUTE_AFK_CHANNEL_ID ||
+        isExcludedSelfMuteChannel(voiceState.channelId)
+      ) {
+        clearSelfMuteTracking(userId);
+        return;
+      }
+
+      const afkChannel = guild.channels.cache.get(SELF_MUTE_AFK_CHANNEL_ID);
+      if (!afkChannel || !afkChannel.isVoiceBased()) {
+        clearSelfMuteTracking(userId);
+        return;
+      }
+
+      await voiceState.setChannel(afkChannel, "Self-muted for 1 hour").catch(() => {});
+      clearSelfMuteTracking(userId);
+    } catch {
+      clearSelfMuteTracking(userId);
+    }
+  }, remaining);
+
+  selfMuteTimers.set(userId, timer);
+}
+
+function syncSelfMuteTracking(state) {
+  const member = state.member;
+  if (!member || member.user.bot) return;
+  if (member.guild.id !== GUILD_ID) return;
+
+  const channelId = state.channelId;
+
+  if (
+    !channelId ||
+    channelId === SELF_MUTE_AFK_CHANNEL_ID ||
+    isExcludedSelfMuteChannel(channelId) ||
+    !state.selfMute
+  ) {
+    clearSelfMuteTracking(member.id);
+    return;
+  }
+
+  armSelfMuteTimer(member);
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -797,6 +897,7 @@ client.once("clientReady", async () => {
     if (!state.member) return;
     if (!state.member.user.bot && state.channelId) {
       startVoiceSession(state.id, state.channelId);
+      syncSelfMuteTracking(state);
     }
   });
 
@@ -1663,26 +1764,38 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 
   if (!oldChannelId && newChannelId) {
     startVoiceSession(member.id, newChannelId);
+    syncSelfMuteTracking(newState);
     return;
   }
 
   if (oldChannelId && !newChannelId) {
     endVoiceSession(member.id);
+    syncSelfMuteTracking(newState);
     return;
   }
 
   if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
     moveVoiceSession(member.id, newChannelId);
   }
+
+  syncSelfMuteTracking(newState);
 });
 
 process.on("SIGINT", () => {
+  for (const timer of selfMuteTimers.values()) {
+    clearTimeout(timer);
+  }
+
   flushActiveVoiceSessions();
   saveDatabase();
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
+  for (const timer of selfMuteTimers.values()) {
+    clearTimeout(timer);
+  }
+
   flushActiveVoiceSessions();
   saveDatabase();
   process.exit(0);
