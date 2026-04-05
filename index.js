@@ -12,7 +12,10 @@ const {
   ButtonBuilder,
   ButtonStyle,
   PermissionsBitField,
-  ChannelType
+  ChannelType,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
@@ -21,6 +24,7 @@ const TOKEN = process.env.TOKEN;
 
 const GUILD_ID = "1367976354104086629";
 const VOICE_CHANNEL_ID = "1401074295022817381";
+const OWNER_ID = "1058107732584050879";
 
 /* ✅ روم الفيديو */
 const VIDEO_ROOM = "1477417977472090316";
@@ -122,9 +126,19 @@ function getUserStats(userId) {
     db.leaderboard.users[userId] = {
       messages: 0,
       voiceMs: 0,
+      manualPoints: 0,
+      manualVoiceMs: 0,
       lastMessageAt: null,
       updatedAt: Date.now()
     };
+  }
+
+  if (typeof db.leaderboard.users[userId].manualPoints !== "number") {
+    db.leaderboard.users[userId].manualPoints = 0;
+  }
+
+  if (typeof db.leaderboard.users[userId].manualVoiceMs !== "number") {
+    db.leaderboard.users[userId].manualVoiceMs = 0;
   }
 
   return db.leaderboard.users[userId];
@@ -205,6 +219,14 @@ function flushActiveVoiceSessions() {
   }
 }
 
+function clampNumber(value, min = 0) {
+  return value < min ? min : value;
+}
+
+function getEffectiveVoiceMs(data) {
+  return clampNumber((data.voiceMs || 0) + (data.manualVoiceMs || 0), 0);
+}
+
 function formatVoiceDuration(ms) {
   const totalMinutes = Math.floor(ms / 60000);
   const hours = Math.floor(totalMinutes / 60);
@@ -219,9 +241,9 @@ function formatVoiceDuration(ms) {
 
 function getLeaderboardScore(data) {
   const messagePoints = data.messages * 1;
-  const voiceMinutes = Math.floor(data.voiceMs / 60000);
+  const voiceMinutes = Math.floor(getEffectiveVoiceMs(data) / 60000);
   const voicePoints = voiceMinutes * 3;
-  return messagePoints + voicePoints;
+  return clampNumber(messagePoints + voicePoints + (data.manualPoints || 0), 0);
 }
 
 function sortLeaderboardEntries() {
@@ -233,7 +255,7 @@ function sortLeaderboardEntries() {
       return bScore - aScore;
     }
 
-    return b[1].voiceMs - a[1].voiceMs;
+    return getEffectiveVoiceMs(b[1]) - getEffectiveVoiceMs(a[1]);
   });
 }
 
@@ -247,7 +269,7 @@ function buildLeaderboardEmbed(guild) {
         .map(([userId, data], index) => {
           return [
             `**#${index + 1}** | <@${userId}>`,
-            `> **النقاط:** \`${getLeaderboardScore(data)}\` | **الرسائل:** \`${data.messages}\` | **الوقت الصوتي:** \`${formatVoiceDuration(data.voiceMs)}\``
+            `> **النقاط:** \`${getLeaderboardScore(data)}\` | **الرسائل:** \`${data.messages}\` | **الوقت الصوتي:** \`${formatVoiceDuration(getEffectiveVoiceMs(data))}\``
           ].join("\n");
         })
         .join("\n\n")
@@ -267,9 +289,94 @@ function buildLeaderboardEmbed(guild) {
       inline: true
     })
     .setFooter({
-      text: "النقاط = الرسائل + وقت الفويس"
+      text: "النقاط = الرسائل + وقت الفويس + التعديل اليدوي"
     })
     .setTimestamp();
+}
+
+function buildLeaderboardControlEmbed(targetUser, stats) {
+  return new EmbedBuilder()
+    .setColor("#f39c12")
+    .setAuthor({
+      name: "Leaderboard Control Panel",
+      iconURL: targetUser.displayAvatarURL()
+    })
+    .setTitle(`🎛 التحكم في ${targetUser.username}`)
+    .setDescription(`<@${targetUser.id}>`)
+    .addFields(
+      { name: "⭐ النقاط الحالية", value: `${getLeaderboardScore(stats)}`, inline: true },
+      { name: "💬 الرسائل", value: `${stats.messages}`, inline: true },
+      { name: "🎤 الوقت الصوتي", value: formatVoiceDuration(getEffectiveVoiceMs(stats)), inline: true },
+      { name: "🧮 النقاط اليدوية", value: `${stats.manualPoints || 0}`, inline: true },
+      { name: "⏱ الفويس اليدوي", value: formatVoiceDuration(stats.manualVoiceMs || 0), inline: true },
+      { name: "🆔 ID", value: targetUser.id, inline: false }
+    )
+    .setFooter({
+      text: "هذه اللوحة للأونر فقط"
+    })
+    .setTimestamp();
+}
+
+function buildLeaderboardControlRows(userId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`lb_add_10_${userId}`)
+        .setLabel("+10")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`lb_sub_10_${userId}`)
+        .setLabel("-10")
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`lb_add_100_${userId}`)
+        .setLabel("+100")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`lb_sub_100_${userId}`)
+        .setLabel("-100")
+        .setStyle(ButtonStyle.Danger)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`lb_set_points_${userId}`)
+        .setLabel("Set Points")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`lb_set_voice_${userId}`)
+        .setLabel("Set Voice")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`lb_reset_${userId}`)
+        .setLabel("Reset Manual")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`lb_refresh_${userId}`)
+        .setLabel("Refresh")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+function isOwner(userId) {
+  return userId === OWNER_ID;
+}
+
+async function updateLeaderboardControlMessage(interaction, targetUserId) {
+  const targetUser = await client.users.fetch(targetUserId).catch(() => null);
+  if (!targetUser) {
+    return interaction.reply({
+      content: "❌ ما قدرت أجيب بيانات العضو.",
+      ephemeral: true
+    });
+  }
+
+  const stats = getUserStats(targetUserId);
+
+  return interaction.update({
+    embeds: [buildLeaderboardControlEmbed(targetUser, stats)],
+    components: buildLeaderboardControlRows(targetUserId)
+  });
 }
 
 async function findExistingLeaderboardMessage(channel) {
@@ -558,6 +665,15 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("leaderboardpanel")
+    .setDescription("لوحة تحكم الليدر بورد للأونر فقط")
+    .addUserOption(o =>
+      o.setName("user")
+        .setDescription("العضو المطلوب التحكم فيه")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
     .setName("kick")
     .setDescription("طرد عضو")
     .addUserOption(o => o.setName("user").setDescription("العضو").setRequired(true))
@@ -721,25 +837,209 @@ client.on("messageCreate", async message => {
 });
 
 client.on("interactionCreate", async interaction => {
-  if (!interaction.isButton()) return;
-  if (interaction.customId !== "leaderboard_refresh") return;
+  if (interaction.isButton()) {
+    if (interaction.customId === "leaderboard_refresh") {
+      if (!interaction.member || !hasLeaderboardRole(interaction.member)) {
+        return interaction.reply({
+          content: "❌ ما عندك صلاحية استخدام زر التحديث.",
+          ephemeral: true
+        });
+      }
 
-  if (!interaction.member || !hasLeaderboardRole(interaction.member)) {
-    return interaction.reply({
-      content: "❌ ما عندك صلاحية استخدام زر التحديث.",
-      ephemeral: true
-    });
+      await updateLeaderboardMessage(interaction.guild);
+
+      return interaction.reply({
+        content: "✅ تم تحديث الليدر بورد.",
+        ephemeral: true
+      });
+    }
+
+    if (interaction.customId.startsWith("lb_")) {
+      if (!isOwner(interaction.user.id)) {
+        return interaction.reply({
+          content: "❌ هذه اللوحة للأونر فقط.",
+          ephemeral: true
+        });
+      }
+
+      const parts = interaction.customId.split("_");
+      const action = parts[1];
+      const maybeSub = parts[2];
+      const targetUserId = parts[parts.length - 1];
+      const stats = getUserStats(targetUserId);
+
+      if (action === "add" && maybeSub === "10") {
+        stats.manualPoints += 10;
+        stats.updatedAt = Date.now();
+        scheduleSave();
+        await updateLeaderboardMessage(interaction.guild);
+        return updateLeaderboardControlMessage(interaction, targetUserId);
+      }
+
+      if (action === "sub" && maybeSub === "10") {
+        stats.manualPoints -= 10;
+        stats.updatedAt = Date.now();
+        scheduleSave();
+        await updateLeaderboardMessage(interaction.guild);
+        return updateLeaderboardControlMessage(interaction, targetUserId);
+      }
+
+      if (action === "add" && maybeSub === "100") {
+        stats.manualPoints += 100;
+        stats.updatedAt = Date.now();
+        scheduleSave();
+        await updateLeaderboardMessage(interaction.guild);
+        return updateLeaderboardControlMessage(interaction, targetUserId);
+      }
+
+      if (action === "sub" && maybeSub === "100") {
+        stats.manualPoints -= 100;
+        stats.updatedAt = Date.now();
+        scheduleSave();
+        await updateLeaderboardMessage(interaction.guild);
+        return updateLeaderboardControlMessage(interaction, targetUserId);
+      }
+
+      if (action === "reset") {
+        stats.manualPoints = 0;
+        stats.manualVoiceMs = 0;
+        stats.updatedAt = Date.now();
+        scheduleSave();
+        await updateLeaderboardMessage(interaction.guild);
+        return updateLeaderboardControlMessage(interaction, targetUserId);
+      }
+
+      if (action === "refresh") {
+        return updateLeaderboardControlMessage(interaction, targetUserId);
+      }
+
+      if (action === "set" && maybeSub === "points") {
+        const modal = new ModalBuilder()
+          .setCustomId(`lbmodal_points_${targetUserId}`)
+          .setTitle("Set Manual Points");
+
+        const input = new TextInputBuilder()
+          .setCustomId("manual_points")
+          .setLabel("اكتب النقاط اليدوية")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(String(stats.manualPoints || 0));
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(input)
+        );
+
+        return interaction.showModal(modal);
+      }
+
+      if (action === "set" && maybeSub === "voice") {
+        const modal = new ModalBuilder()
+          .setCustomId(`lbmodal_voice_${targetUserId}`)
+          .setTitle("Set Manual Voice");
+
+        const hoursInput = new TextInputBuilder()
+          .setCustomId("manual_voice_hours")
+          .setLabel("الساعات")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue("0");
+
+        const minutesInput = new TextInputBuilder()
+          .setCustomId("manual_voice_minutes")
+          .setLabel("الدقائق")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue("0");
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(hoursInput),
+          new ActionRowBuilder().addComponents(minutesInput)
+        );
+
+        return interaction.showModal(modal);
+      }
+    }
   }
 
-  await updateLeaderboardMessage(interaction.guild);
+  if (interaction.isModalSubmit()) {
+    if (!isOwner(interaction.user.id)) {
+      return interaction.reply({
+        content: "❌ هذا التعديل للأونر فقط.",
+        ephemeral: true
+      });
+    }
 
-  return interaction.reply({
-    content: "✅ تم تحديث الليدر بورد.",
-    ephemeral: true
-  });
-});
+    if (interaction.customId.startsWith("lbmodal_points_")) {
+      const targetUserId = interaction.customId.replace("lbmodal_points_", "");
+      const stats = getUserStats(targetUserId);
+      const raw = interaction.fields.getTextInputValue("manual_points").trim();
+      const parsed = Number(raw);
 
-client.on("interactionCreate", async interaction => {
+      if (Number.isNaN(parsed)) {
+        return interaction.reply({
+          content: "❌ لازم تكتب رقم صحيح.",
+          ephemeral: true
+        });
+      }
+
+      stats.manualPoints = parsed;
+      stats.updatedAt = Date.now();
+      scheduleSave();
+      await updateLeaderboardMessage(interaction.guild);
+
+      const targetUser = await client.users.fetch(targetUserId).catch(() => null);
+      if (!targetUser) {
+        return interaction.reply({
+          content: "✅ تم تعديل النقاط، لكن ما قدرت أجيب العضو.",
+          ephemeral: true
+        });
+      }
+
+      return interaction.reply({
+        embeds: [buildLeaderboardControlEmbed(targetUser, stats)],
+        components: buildLeaderboardControlRows(targetUserId),
+        ephemeral: true
+      });
+    }
+
+    if (interaction.customId.startsWith("lbmodal_voice_")) {
+      const targetUserId = interaction.customId.replace("lbmodal_voice_", "");
+      const stats = getUserStats(targetUserId);
+
+      const rawHours = interaction.fields.getTextInputValue("manual_voice_hours").trim();
+      const rawMinutes = interaction.fields.getTextInputValue("manual_voice_minutes").trim();
+
+      const hours = Number(rawHours);
+      const minutes = Number(rawMinutes);
+
+      if (Number.isNaN(hours) || Number.isNaN(minutes) || hours < 0 || minutes < 0) {
+        return interaction.reply({
+          content: "❌ لازم تكتب ساعات ودقائق بشكل صحيح.",
+          ephemeral: true
+        });
+      }
+
+      stats.manualVoiceMs = ((hours * 60) + minutes) * 60 * 1000;
+      stats.updatedAt = Date.now();
+      scheduleSave();
+      await updateLeaderboardMessage(interaction.guild);
+
+      const targetUser = await client.users.fetch(targetUserId).catch(() => null);
+      if (!targetUser) {
+        return interaction.reply({
+          content: "✅ تم تعديل الفويس، لكن ما قدرت أجيب العضو.",
+          ephemeral: true
+        });
+      }
+
+      return interaction.reply({
+        embeds: [buildLeaderboardControlEmbed(targetUser, stats)],
+        components: buildLeaderboardControlRows(targetUserId),
+        ephemeral: true
+      });
+    }
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const user = interaction.user;
@@ -749,6 +1049,24 @@ client.on("interactionCreate", async interaction => {
 
     return interaction.reply({
       content: mediaOnlyEnabled ? "✅ تم تشغيل النظام" : "❌ تم ايقاف النظام",
+      ephemeral: true
+    });
+  }
+
+  if (interaction.commandName === "leaderboardpanel") {
+    if (!isOwner(interaction.user.id)) {
+      return interaction.reply({
+        content: "❌ هذا الأمر للأونر فقط.",
+        ephemeral: true
+      });
+    }
+
+    const targetUser = interaction.options.getUser("user");
+    const stats = getUserStats(targetUser.id);
+
+    return interaction.reply({
+      embeds: [buildLeaderboardControlEmbed(targetUser, stats)],
+      components: buildLeaderboardControlRows(targetUser.id),
       ephemeral: true
     });
   }
@@ -827,7 +1145,9 @@ client.on("interactionCreate", async interaction => {
         .addFields(
           { name: "⭐ النقاط", value: `${getLeaderboardScore(stats)}`, inline: true },
           { name: "💬 عدد الرسائل", value: `${stats.messages}`, inline: true },
-          { name: "🎤 الوقت الصوتي", value: formatVoiceDuration(stats.voiceMs), inline: true }
+          { name: "🎤 الوقت الصوتي", value: formatVoiceDuration(getEffectiveVoiceMs(stats)), inline: true },
+          { name: "🧮 النقاط اليدوية", value: `${stats.manualPoints || 0}`, inline: true },
+          { name: "⏱ الفويس اليدوي", value: formatVoiceDuration(stats.manualVoiceMs || 0), inline: true }
         )
         .setFooter({ text: interaction.guild.name })
         .setTimestamp();
