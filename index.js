@@ -29,9 +29,11 @@ const OWNER_ID = "1058107732584050879";
 /* ✅ روم الفيديو */
 const VIDEO_ROOM = "1477417977472090316";
 
-/* ✅ روم الليدر بورد + رتبة التحكم */
+/* ✅ روم الليدر بورد + رتبة التحكم + الكاتاقوري المعتمدة */
 const LEADERBOARD_CHANNEL_ID = "1484809257361870892";
 const LEADERBOARD_ROLE_ID = "1426999940944756889";
+const LEADERBOARD_CATEGORY_ID = "1398274126442922087";
+const LEADERBOARD_SCOPE_VERSION = 2;
 
 /* ✅ تحديث تلقائي كل 5 ثواني */
 const LEADERBOARD_UPDATE_INTERVAL = 5000;
@@ -80,6 +82,7 @@ const db = {
   leaderboard: {
     channelId: LEADERBOARD_CHANNEL_ID,
     messageId: null,
+    scopeVersion: LEADERBOARD_SCOPE_VERSION,
     users: {}
   }
 };
@@ -107,8 +110,20 @@ function loadDatabase() {
     db.leaderboard = {
       channelId: parsed.leaderboard?.channelId || LEADERBOARD_CHANNEL_ID,
       messageId: parsed.leaderboard?.messageId || null,
+      scopeVersion: parsed.leaderboard?.scopeVersion || 1,
       users: parsed.leaderboard?.users || {}
     };
+
+    if (db.leaderboard.scopeVersion < LEADERBOARD_SCOPE_VERSION) {
+      for (const userData of Object.values(db.leaderboard.users)) {
+        userData.messages = 0;
+        userData.voiceMs = 0;
+        userData.updatedAt = Date.now();
+      }
+
+      db.leaderboard.scopeVersion = LEADERBOARD_SCOPE_VERSION;
+      saveDatabase();
+    }
   } catch (error) {
     console.error("❌ Failed to load database:", error);
   }
@@ -129,6 +144,66 @@ function scheduleSave() {
     flushActiveVoiceSessions();
     saveDatabase();
   }, 500);
+}
+
+function isLeaderboardTrackedCategory(channel) {
+  return !!channel && channel.parentId === LEADERBOARD_CATEGORY_ID;
+}
+
+function shouldTrackLeaderboardMessage(message) {
+  return (
+    !!message.guild &&
+    message.guild.id === GUILD_ID &&
+    !message.author.bot &&
+    hasLeaderboardRole(message.member) &&
+    isLeaderboardTrackedCategory(message.channel)
+  );
+}
+
+function shouldTrackLeaderboardVoice(member, channel) {
+  if (!member || member.user.bot || !channel || !channel.isVoiceBased()) return false;
+  if (!hasLeaderboardRole(member)) return false;
+  if (channel.id === SELF_MUTE_AFK_CHANNEL_ID) return false;
+  if (member.guild.afkChannelId && channel.id === member.guild.afkChannelId) return false;
+  if (member.voice?.channelId !== channel.id) return false;
+  return isLeaderboardTrackedCategory(channel);
+}
+
+function commitVoiceSessionTime(userId, session, now = Date.now()) {
+  if (!session || !session.counting) return;
+
+  const elapsed = now - session.joinedAt;
+  if (elapsed <= 0) return;
+
+  const stats = getUserStats(userId);
+  stats.voiceMs += elapsed;
+  stats.updatedAt = now;
+}
+
+function refreshVoiceSessionTracking(member) {
+  if (!member || member.user.bot) return;
+
+  const session = activeVoiceSessions.get(member.id);
+  if (!session) return;
+
+  const now = Date.now();
+  const currentChannel = member.voice?.channel || null;
+
+  commitVoiceSessionTime(member.id, session, now);
+
+  if (!currentChannel) {
+    activeVoiceSessions.delete(member.id);
+    scheduleSave();
+    return;
+  }
+
+  activeVoiceSessions.set(member.id, {
+    channelId: currentChannel.id,
+    joinedAt: now,
+    counting: shouldTrackLeaderboardVoice(member, currentChannel)
+  });
+
+  scheduleSave();
 }
 
 function getUserStats(userId) {
@@ -162,12 +237,15 @@ function addMessageCount(userId) {
   scheduleSave();
 }
 
-function startVoiceSession(userId, channelId) {
-  if (activeVoiceSessions.has(userId)) return;
+function startVoiceSession(member, channelId) {
+  if (!member || activeVoiceSessions.has(member.id)) return;
 
-  activeVoiceSessions.set(userId, {
+  const channel = member.guild.channels.cache.get(channelId);
+
+  activeVoiceSessions.set(member.id, {
     channelId,
-    joinedAt: Date.now()
+    joinedAt: Date.now(),
+    counting: shouldTrackLeaderboardVoice(member, channel)
   });
 }
 
@@ -175,56 +253,55 @@ function endVoiceSession(userId) {
   const session = activeVoiceSessions.get(userId);
   if (!session) return;
 
-  const stats = getUserStats(userId);
-  const elapsed = Date.now() - session.joinedAt;
-
-  if (elapsed > 0) {
-    stats.voiceMs += elapsed;
-    stats.updatedAt = Date.now();
-  }
-
+  commitVoiceSessionTime(userId, session);
   activeVoiceSessions.delete(userId);
   scheduleSave();
 }
 
-function moveVoiceSession(userId, newChannelId) {
-  const session = activeVoiceSessions.get(userId);
+function moveVoiceSession(member, newChannelId) {
+  if (!member) return;
+
+  const session = activeVoiceSessions.get(member.id);
 
   if (!session) {
-    startVoiceSession(userId, newChannelId);
+    startVoiceSession(member, newChannelId);
     return;
   }
 
-  const stats = getUserStats(userId);
-  const elapsed = Date.now() - session.joinedAt;
+  const now = Date.now();
+  commitVoiceSessionTime(member.id, session, now);
 
-  if (elapsed > 0) {
-    stats.voiceMs += elapsed;
-  }
+  const channel = member.guild.channels.cache.get(newChannelId);
 
-  activeVoiceSessions.set(userId, {
+  activeVoiceSessions.set(member.id, {
     channelId: newChannelId,
-    joinedAt: Date.now()
+    joinedAt: now,
+    counting: shouldTrackLeaderboardVoice(member, channel)
   });
 
-  stats.updatedAt = Date.now();
   scheduleSave();
 }
 
 function flushActiveVoiceSessions() {
   const now = Date.now();
+  const guild = client.guilds.cache.get(GUILD_ID);
+  if (!guild) return;
 
   for (const [userId, session] of activeVoiceSessions.entries()) {
-    const elapsed = now - session.joinedAt;
-    if (elapsed <= 0) continue;
+    commitVoiceSessionTime(userId, session, now);
 
-    const stats = getUserStats(userId);
-    stats.voiceMs += elapsed;
-    stats.updatedAt = now;
+    const member = guild.members.cache.get(userId);
+    const currentChannel = member?.voice?.channel || null;
+
+    if (!currentChannel) {
+      activeVoiceSessions.delete(userId);
+      continue;
+    }
 
     activeVoiceSessions.set(userId, {
-      channelId: session.channelId,
-      joinedAt: now
+      channelId: currentChannel.id,
+      joinedAt: now,
+      counting: shouldTrackLeaderboardVoice(member, currentChannel)
     });
   }
 }
@@ -256,23 +333,28 @@ function getLeaderboardScore(data) {
   return clampNumber(messagePoints + voicePoints + (data.manualPoints || 0), 0);
 }
 
-function sortLeaderboardEntries() {
-  return Object.entries(db.leaderboard.users).sort((a, b) => {
-    const aScore = getLeaderboardScore(a[1]);
-    const bScore = getLeaderboardScore(b[1]);
+function sortLeaderboardEntries(guild) {
+  return Object.entries(db.leaderboard.users)
+    .filter(([userId]) => {
+      const member = guild.members.cache.get(userId);
+      return hasLeaderboardRole(member);
+    })
+    .sort((a, b) => {
+      const aScore = getLeaderboardScore(a[1]);
+      const bScore = getLeaderboardScore(b[1]);
 
-    if (bScore !== aScore) {
-      return bScore - aScore;
-    }
+      if (bScore !== aScore) {
+        return bScore - aScore;
+      }
 
-    return getEffectiveVoiceMs(b[1]) - getEffectiveVoiceMs(a[1]);
-  });
+      return getEffectiveVoiceMs(b[1]) - getEffectiveVoiceMs(a[1]);
+    });
 }
 
 function buildLeaderboardEmbed(guild) {
   flushActiveVoiceSessions();
 
-  const entries = sortLeaderboardEntries().slice(0, 10);
+  const entries = sortLeaderboardEntries(guild).slice(0, 10);
 
   const description = entries.length
     ? entries
@@ -283,7 +365,7 @@ function buildLeaderboardEmbed(guild) {
           ].join("\n");
         })
         .join("\n\n")
-    : "لا يوجد بيانات حتى الآن.";
+    : "لا يوجد بيانات داخل الكاتاقوري المحددة حتى الآن.";
 
   return new EmbedBuilder()
     .setColor("#000000")
@@ -299,7 +381,7 @@ function buildLeaderboardEmbed(guild) {
       inline: true
     })
     .setFooter({
-      text: "النقاط = الرسائل + وقت الفويس + التعديل اليدوي"
+      text: "النقاط = رسائل وفويس الكاتاقوري المحددة + التعديل اليدوي"
     })
     .setTimestamp();
 }
@@ -478,7 +560,7 @@ async function updateLeaderboardMessage(guild) {
 }
 
 function hasLeaderboardRole(member) {
-  return member.roles.cache.has(LEADERBOARD_ROLE_ID);
+  return !!member && member.roles.cache.has(LEADERBOARD_ROLE_ID);
 }
 
 function hasAdmin(member) {
@@ -883,6 +965,8 @@ client.once("clientReady", async () => {
   const guild = client.guilds.cache.get(GUILD_ID);
   if (!guild) return;
 
+  await guild.members.fetch().catch(() => {});
+
   const voiceChannel = guild.channels.cache.get(VOICE_CHANNEL_ID);
   if (voiceChannel && voiceChannel.isVoiceBased()) {
     joinVoiceChannel({
@@ -896,7 +980,7 @@ client.once("clientReady", async () => {
   guild.voiceStates.cache.forEach(state => {
     if (!state.member) return;
     if (!state.member.user.bot && state.channelId) {
-      startVoiceSession(state.id, state.channelId);
+      startVoiceSession(state.member, state.channelId);
       syncSelfMuteTracking(state);
     }
   });
@@ -923,17 +1007,18 @@ client.on("messageCreate", async message => {
   if (!message.guild || message.guild.id !== GUILD_ID) return;
   if (message.author.bot) return;
 
-  addMessageCount(message.author.id);
+  if (mediaOnlyEnabled && message.channel.id === VIDEO_ROOM) {
+    if (message.attachments.size === 0) {
+      return message.delete().catch(() => {});
+    }
 
-  if (!mediaOnlyEnabled) return;
-  if (message.channel.id !== VIDEO_ROOM) return;
-
-  if (message.attachments.size === 0) {
-    return message.delete().catch(() => {});
+    if (message.content && message.content.trim() !== "") {
+      return message.delete().catch(() => {});
+    }
   }
 
-  if (message.content && message.content.trim() !== "") {
-    return message.delete().catch(() => {});
+  if (shouldTrackLeaderboardMessage(message)) {
+    addMessageCount(message.author.id);
   }
 });
 
@@ -1250,7 +1335,7 @@ client.on("interactionCreate", async interaction => {
           { name: "🧮 النقاط اليدوية", value: `${stats.manualPoints || 0}`, inline: true },
           { name: "⏱ الفويس اليدوي", value: formatVoiceDuration(stats.manualVoiceMs || 0), inline: true }
         )
-        .setFooter({ text: interaction.guild.name })
+        .setFooter({ text: "الإحصائيات تحسب فقط داخل الكاتاقوري المحددة ولأصحاب الرتبة" })
         .setTimestamp();
 
       return interaction.reply({
@@ -1702,6 +1787,8 @@ client.on("interactionCreate", async interaction => {
 });
 
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  refreshVoiceSessionTracking(newMember);
+
   const data = warningMapGet(newMember.id);
   if (!data) return;
 
@@ -1763,7 +1850,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   const newChannelId = newState.channelId;
 
   if (!oldChannelId && newChannelId) {
-    startVoiceSession(member.id, newChannelId);
+    startVoiceSession(member, newChannelId);
     syncSelfMuteTracking(newState);
     return;
   }
@@ -1775,7 +1862,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   }
 
   if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
-    moveVoiceSession(member.id, newChannelId);
+    moveVoiceSession(member, newChannelId);
   }
 
   syncSelfMuteTracking(newState);
