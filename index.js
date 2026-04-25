@@ -15,7 +15,8 @@ const {
   ChannelType,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  AuditLogEvent
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
@@ -29,11 +30,10 @@ const OWNER_ID = "1058107732584050879";
 /* ✅ روم الفيديو */
 const VIDEO_ROOM = "1477417977472090316";
 
-/* ✅ روم الليدر بورد + رتبة التحكم + الكاتاقوري المعتمدة */
+/* ✅ روم الليدر بورد + رتبة التحكم */
 const LEADERBOARD_CHANNEL_ID = "1484809257361870892";
 const LEADERBOARD_ROLE_ID = "1426999940944756889";
-const LEADERBOARD_CATEGORY_ID = "1398274126442922087";
-const LEADERBOARD_SCOPE_VERSION = 2;
+const LEADERBOARD_VOICE_CATEGORY_ID = "1398274126442922087";
 
 /* ✅ تحديث تلقائي كل 5 ثواني */
 const LEADERBOARD_UPDATE_INTERVAL = 5000;
@@ -45,27 +45,23 @@ const SELF_MUTE_EXEMPT_CHANNEL_IDS = [
 ];
 const SELF_MUTE_MOVE_DELAY_MS = 60 * 60 * 1000;
 
-const selfMuteTimers = new Map();
-const selfMuteStartedAt = new Map();
+/* ✅ DM ALL Verification */
+const DMALL_CODE_EXPIRE_MS = 10 * 60 * 1000;
+const DMALL_USE_EXPIRE_MS = 10 * 60 * 1000;
+const DMALL_MAX_ACTIVE_CODES = 5;
+
+/* ✅ Anti Abuse */
+const ANTI_ABUSE_MOVE_WINDOW_MS = 60 * 1000;
+const ANTI_ABUSE_MOVE_LIMIT = 5;
+const ANTI_ABUSE_TIMEOUT_WINDOW_MS = 10 * 60 * 1000;
+const ANTI_ABUSE_TIMEOUT_LIMIT = 3;
+const AUDIT_ENTRY_MAX_AGE_MS = 15 * 1000;
 
 /* ✅ حالة النظام */
 let mediaOnlyEnabled = true;
 
 const LOG_SEND = "1367984035283996753";
-const LOG_WARN = "1482927462168920186";
-const LOG_WARNINGS = "1482927612627128516";
 const LOG_DMALL = "1482927730050859080";
-const LOG_CLEARWARN = "1482927958548287499";
-
-/* WARN ROLES */
-const WARN_ROLES = {
-  1: "1482963105943126108",
-  2: "1482963310860042300",
-  3: "1482963374605340734",
-  4: "1482963614775115837",
-  5: "1482963685428433068",
-  6: "1482963748267233412"
-};
 
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "bot-data.json");
@@ -75,14 +71,21 @@ let leaderboardInterval = null;
 let leaderboardUpdating = false;
 
 const activeVoiceSessions = new Map();
+const selfMuteTimers = new Map();
+const selfMuteStartedAt = new Map();
+const dmallVerificationCodes = new Map();
+const dmallVerifiedUses = new Map();
+const processedAuditEntries = new Map();
+const moderationAbuse = {
+  move: new Map(),
+  timeout: new Map()
+};
 
 const db = {
-  warnings: {},
   blacklist: {},
   leaderboard: {
     channelId: LEADERBOARD_CHANNEL_ID,
     messageId: null,
-    scopeVersion: LEADERBOARD_SCOPE_VERSION,
     users: {}
   }
 };
@@ -105,25 +108,12 @@ function loadDatabase() {
     const raw = fs.readFileSync(DATA_FILE, "utf8");
     const parsed = JSON.parse(raw);
 
-    db.warnings = parsed.warnings || {};
     db.blacklist = parsed.blacklist || {};
     db.leaderboard = {
       channelId: parsed.leaderboard?.channelId || LEADERBOARD_CHANNEL_ID,
       messageId: parsed.leaderboard?.messageId || null,
-      scopeVersion: parsed.leaderboard?.scopeVersion || 1,
       users: parsed.leaderboard?.users || {}
     };
-
-    if (db.leaderboard.scopeVersion < LEADERBOARD_SCOPE_VERSION) {
-      for (const userData of Object.values(db.leaderboard.users)) {
-        userData.messages = 0;
-        userData.voiceMs = 0;
-        userData.updatedAt = Date.now();
-      }
-
-      db.leaderboard.scopeVersion = LEADERBOARD_SCOPE_VERSION;
-      saveDatabase();
-    }
   } catch (error) {
     console.error("❌ Failed to load database:", error);
   }
@@ -144,66 +134,6 @@ function scheduleSave() {
     flushActiveVoiceSessions();
     saveDatabase();
   }, 500);
-}
-
-function isLeaderboardTrackedCategory(channel) {
-  return !!channel && channel.parentId === LEADERBOARD_CATEGORY_ID;
-}
-
-function shouldTrackLeaderboardMessage(message) {
-  return (
-    !!message.guild &&
-    message.guild.id === GUILD_ID &&
-    !message.author.bot &&
-    hasLeaderboardRole(message.member) &&
-    isLeaderboardTrackedCategory(message.channel)
-  );
-}
-
-function shouldTrackLeaderboardVoice(member, channel) {
-  if (!member || member.user.bot || !channel || !channel.isVoiceBased()) return false;
-  if (!hasLeaderboardRole(member)) return false;
-  if (channel.id === SELF_MUTE_AFK_CHANNEL_ID) return false;
-  if (member.guild.afkChannelId && channel.id === member.guild.afkChannelId) return false;
-  if (member.voice?.channelId !== channel.id) return false;
-  return isLeaderboardTrackedCategory(channel);
-}
-
-function commitVoiceSessionTime(userId, session, now = Date.now()) {
-  if (!session || !session.counting) return;
-
-  const elapsed = now - session.joinedAt;
-  if (elapsed <= 0) return;
-
-  const stats = getUserStats(userId);
-  stats.voiceMs += elapsed;
-  stats.updatedAt = now;
-}
-
-function refreshVoiceSessionTracking(member) {
-  if (!member || member.user.bot) return;
-
-  const session = activeVoiceSessions.get(member.id);
-  if (!session) return;
-
-  const now = Date.now();
-  const currentChannel = member.voice?.channel || null;
-
-  commitVoiceSessionTime(member.id, session, now);
-
-  if (!currentChannel) {
-    activeVoiceSessions.delete(member.id);
-    scheduleSave();
-    return;
-  }
-
-  activeVoiceSessions.set(member.id, {
-    channelId: currentChannel.id,
-    joinedAt: now,
-    counting: shouldTrackLeaderboardVoice(member, currentChannel)
-  });
-
-  scheduleSave();
 }
 
 function getUserStats(userId) {
@@ -237,71 +167,75 @@ function addMessageCount(userId) {
   scheduleSave();
 }
 
-function startVoiceSession(member, channelId) {
-  if (!member || activeVoiceSessions.has(member.id)) return;
+function startVoiceSession(userId, channelId) {
+  if (activeVoiceSessions.has(userId)) {
+    return;
+  }
 
-  const channel = member.guild.channels.cache.get(channelId);
-
-  activeVoiceSessions.set(member.id, {
+  activeVoiceSessions.set(userId, {
     channelId,
-    joinedAt: Date.now(),
-    counting: shouldTrackLeaderboardVoice(member, channel)
+    joinedAt: Date.now()
   });
 }
 
 function endVoiceSession(userId) {
   const session = activeVoiceSessions.get(userId);
-  if (!session) return;
+  if (!session) {
+    return;
+  }
 
-  commitVoiceSessionTime(userId, session);
+  const stats = getUserStats(userId);
+  const elapsed = Date.now() - session.joinedAt;
+
+  if (elapsed > 0) {
+    stats.voiceMs += elapsed;
+    stats.updatedAt = Date.now();
+  }
+
   activeVoiceSessions.delete(userId);
   scheduleSave();
 }
 
-function moveVoiceSession(member, newChannelId) {
-  if (!member) return;
-
-  const session = activeVoiceSessions.get(member.id);
+function moveVoiceSession(userId, newChannelId) {
+  const session = activeVoiceSessions.get(userId);
 
   if (!session) {
-    startVoiceSession(member, newChannelId);
+    startVoiceSession(userId, newChannelId);
     return;
   }
 
-  const now = Date.now();
-  commitVoiceSessionTime(member.id, session, now);
+  const stats = getUserStats(userId);
+  const elapsed = Date.now() - session.joinedAt;
 
-  const channel = member.guild.channels.cache.get(newChannelId);
+  if (elapsed > 0) {
+    stats.voiceMs += elapsed;
+  }
 
-  activeVoiceSessions.set(member.id, {
+  activeVoiceSessions.set(userId, {
     channelId: newChannelId,
-    joinedAt: now,
-    counting: shouldTrackLeaderboardVoice(member, channel)
+    joinedAt: Date.now()
   });
 
+  stats.updatedAt = Date.now();
   scheduleSave();
 }
 
 function flushActiveVoiceSessions() {
   const now = Date.now();
-  const guild = client.guilds.cache.get(GUILD_ID);
-  if (!guild) return;
 
   for (const [userId, session] of activeVoiceSessions.entries()) {
-    commitVoiceSessionTime(userId, session, now);
-
-    const member = guild.members.cache.get(userId);
-    const currentChannel = member?.voice?.channel || null;
-
-    if (!currentChannel) {
-      activeVoiceSessions.delete(userId);
+    const elapsed = now - session.joinedAt;
+    if (elapsed <= 0) {
       continue;
     }
 
+    const stats = getUserStats(userId);
+    stats.voiceMs += elapsed;
+    stats.updatedAt = now;
+
     activeVoiceSessions.set(userId, {
-      channelId: currentChannel.id,
-      joinedAt: now,
-      counting: shouldTrackLeaderboardVoice(member, currentChannel)
+      channelId: session.channelId,
+      joinedAt: now
     });
   }
 }
@@ -333,28 +267,23 @@ function getLeaderboardScore(data) {
   return clampNumber(messagePoints + voicePoints + (data.manualPoints || 0), 0);
 }
 
-function sortLeaderboardEntries(guild) {
-  return Object.entries(db.leaderboard.users)
-    .filter(([userId]) => {
-      const member = guild.members.cache.get(userId);
-      return hasLeaderboardRole(member);
-    })
-    .sort((a, b) => {
-      const aScore = getLeaderboardScore(a[1]);
-      const bScore = getLeaderboardScore(b[1]);
+function sortLeaderboardEntries() {
+  return Object.entries(db.leaderboard.users).sort((a, b) => {
+    const aScore = getLeaderboardScore(a[1]);
+    const bScore = getLeaderboardScore(b[1]);
 
-      if (bScore !== aScore) {
-        return bScore - aScore;
-      }
+    if (bScore !== aScore) {
+      return bScore - aScore;
+    }
 
-      return getEffectiveVoiceMs(b[1]) - getEffectiveVoiceMs(a[1]);
-    });
+    return getEffectiveVoiceMs(b[1]) - getEffectiveVoiceMs(a[1]);
+  });
 }
 
 function buildLeaderboardEmbed(guild) {
   flushActiveVoiceSessions();
 
-  const entries = sortLeaderboardEntries(guild).slice(0, 10);
+  const entries = sortLeaderboardEntries().slice(0, 10);
 
   const description = entries.length
     ? entries
@@ -365,7 +294,7 @@ function buildLeaderboardEmbed(guild) {
           ].join("\n");
         })
         .join("\n\n")
-    : "لا يوجد بيانات داخل الكاتاقوري المحددة حتى الآن.";
+    : "لا يوجد بيانات حتى الآن.";
 
   return new EmbedBuilder()
     .setColor("#000000")
@@ -381,7 +310,7 @@ function buildLeaderboardEmbed(guild) {
       inline: true
     })
     .setFooter({
-      text: "النقاط = رسائل وفويس الكاتاقوري المحددة + التعديل اليدوي"
+      text: "النقاط = الرسائل + وقت الفويس من الكاتقوري المحدد + التعديل اليدوي"
     })
     .setTimestamp();
 }
@@ -491,7 +420,9 @@ async function findExistingLeaderboardMessage(channel) {
 
 async function ensureLeaderboardMessage(guild) {
   const channel = guild.channels.cache.get(db.leaderboard.channelId);
-  if (!channel || !channel.isTextBased()) return null;
+  if (!channel || !channel.isTextBased()) {
+    return null;
+  }
 
   if (db.leaderboard.messageId) {
     try {
@@ -529,15 +460,22 @@ async function ensureLeaderboardMessage(guild) {
 }
 
 async function updateLeaderboardMessage(guild) {
-  if (leaderboardUpdating) return;
+  if (leaderboardUpdating) {
+    return;
+  }
+
   leaderboardUpdating = true;
 
   try {
     const channel = guild.channels.cache.get(db.leaderboard.channelId);
-    if (!channel || !channel.isTextBased()) return;
+    if (!channel || !channel.isTextBased()) {
+      return;
+    }
 
     const message = await ensureLeaderboardMessage(guild);
-    if (!message) return;
+    if (!message) {
+      return;
+    }
 
     await message.edit({
       embeds: [buildLeaderboardEmbed(guild)],
@@ -560,7 +498,7 @@ async function updateLeaderboardMessage(guild) {
 }
 
 function hasLeaderboardRole(member) {
-  return !!member && member.roles.cache.has(LEADERBOARD_ROLE_ID);
+  return member.roles.cache.has(LEADERBOARD_ROLE_ID);
 }
 
 function hasAdmin(member) {
@@ -585,20 +523,6 @@ function denyReply(interaction) {
     content: "❌ لا يمكنك استخدام الأمر",
     ephemeral: true
   });
-}
-
-function warningMapGet(userId) {
-  return db.warnings[userId] || null;
-}
-
-function warningMapSet(userId, value) {
-  db.warnings[userId] = value;
-  scheduleSave();
-}
-
-function warningMapDelete(userId) {
-  delete db.warnings[userId];
-  scheduleSave();
 }
 
 function blacklistGet(userId) {
@@ -635,14 +559,14 @@ function parseChannelIds(input) {
 
 async function setRoleViewForChannel(channel, roleId, visible) {
   await channel.permissionOverwrites.edit(roleId, {
-    ViewChannel: visible ? true : false
+    ViewChannel: visible
   }).catch(() => {});
 }
 
 async function setRoleSendForChannel(channel, roleId, allowed) {
   if (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement) {
     await channel.permissionOverwrites.edit(roleId, {
-      SendMessages: allowed ? true : false
+      SendMessages: allowed
     }).catch(() => {});
   }
 }
@@ -650,8 +574,8 @@ async function setRoleSendForChannel(channel, roleId, allowed) {
 async function setRoleConnectForChannel(channel, roleId, allowed) {
   if (channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice) {
     await channel.permissionOverwrites.edit(roleId, {
-      Connect: allowed ? true : false,
-      Speak: allowed ? true : false
+      Connect: allowed,
+      Speak: allowed
     }).catch(() => {});
   }
 }
@@ -754,8 +678,13 @@ function armSelfMuteTimer(member) {
 
 function syncSelfMuteTracking(state) {
   const member = state.member;
-  if (!member || member.user.bot) return;
-  if (member.guild.id !== GUILD_ID) return;
+  if (!member || member.user.bot) {
+    return;
+  }
+
+  if (member.guild.id !== GUILD_ID) {
+    return;
+  }
 
   const channelId = state.channelId;
 
@@ -770,6 +699,293 @@ function syncSelfMuteTracking(state) {
   }
 
   armSelfMuteTimer(member);
+}
+
+function isTrackedLeaderboardVoiceChannel(channel) {
+  return Boolean(
+    channel &&
+    channel.isVoiceBased() &&
+    channel.parentId === LEADERBOARD_VOICE_CATEGORY_ID
+  );
+}
+
+function syncLeaderboardVoiceTracking(oldState, newState) {
+  const member = newState.member || oldState.member;
+  if (!member || member.user.bot || member.guild.id !== GUILD_ID) {
+    return;
+  }
+
+  const wasTracked = isTrackedLeaderboardVoiceChannel(oldState.channel);
+  const isTracked = isTrackedLeaderboardVoiceChannel(newState.channel);
+
+  if (!wasTracked && isTracked) {
+    startVoiceSession(member.id, newState.channelId);
+    return;
+  }
+
+  if (wasTracked && !isTracked) {
+    endVoiceSession(member.id);
+    return;
+  }
+
+  if (wasTracked && isTracked && oldState.channelId !== newState.channelId) {
+    moveVoiceSession(member.id, newState.channelId);
+  }
+}
+
+function cleanupExpiredDmallCodes(userId) {
+  const now = Date.now();
+  const codes = dmallVerificationCodes.get(userId) || [];
+  const validCodes = codes.filter(entry => entry.expiresAt > now);
+
+  if (validCodes.length) {
+    dmallVerificationCodes.set(userId, validCodes);
+  } else {
+    dmallVerificationCodes.delete(userId);
+  }
+
+  const grant = dmallVerifiedUses.get(userId);
+  if (grant && grant.expiresAt <= now) {
+    dmallVerifiedUses.delete(userId);
+  }
+}
+
+function generateDmallCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function createDmallCode(userId) {
+  cleanupExpiredDmallCodes(userId);
+
+  const currentCodes = dmallVerificationCodes.get(userId) || [];
+  const nextCodes = currentCodes.slice(-(DMALL_MAX_ACTIVE_CODES - 1));
+  const code = generateDmallCode();
+
+  nextCodes.push({
+    code,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + DMALL_CODE_EXPIRE_MS
+  });
+
+  dmallVerificationCodes.set(userId, nextCodes);
+  return code;
+}
+
+function verifyDmallCode(userId, code) {
+  cleanupExpiredDmallCodes(userId);
+
+  const codes = dmallVerificationCodes.get(userId) || [];
+  const match = codes.find(entry => entry.code === code);
+
+  if (!match) {
+    return false;
+  }
+
+  dmallVerificationCodes.set(
+    userId,
+    codes.filter(entry => entry.code !== code)
+  );
+
+  dmallVerifiedUses.set(userId, {
+    remainingUses: 1,
+    expiresAt: Date.now() + DMALL_USE_EXPIRE_MS
+  });
+
+  return true;
+}
+
+function consumeDmallVerifiedUse(userId) {
+  cleanupExpiredDmallCodes(userId);
+
+  const grant = dmallVerifiedUses.get(userId);
+  if (!grant || grant.remainingUses <= 0) {
+    return false;
+  }
+
+  grant.remainingUses -= 1;
+
+  if (grant.remainingUses <= 0) {
+    dmallVerifiedUses.delete(userId);
+  } else {
+    dmallVerifiedUses.set(userId, grant);
+  }
+
+  return true;
+}
+
+function cleanupProcessedAuditEntries() {
+  const now = Date.now();
+
+  for (const [entryId, timestamp] of processedAuditEntries.entries()) {
+    if (now - timestamp > AUDIT_ENTRY_MAX_AGE_MS) {
+      processedAuditEntries.delete(entryId);
+    }
+  }
+}
+
+function markAuditEntryProcessed(entryId) {
+  cleanupProcessedAuditEntries();
+  processedAuditEntries.set(entryId, Date.now());
+}
+
+function isAuditEntryProcessed(entryId) {
+  cleanupProcessedAuditEntries();
+  return processedAuditEntries.has(entryId);
+}
+
+function recordAbuseAction(userId, actionType, amount = 1) {
+  const config = actionType === "move"
+    ? { windowMs: ANTI_ABUSE_MOVE_WINDOW_MS, limit: ANTI_ABUSE_MOVE_LIMIT }
+    : { windowMs: ANTI_ABUSE_TIMEOUT_WINDOW_MS, limit: ANTI_ABUSE_TIMEOUT_LIMIT };
+
+  const store = moderationAbuse[actionType];
+  const now = Date.now();
+  const entries = store.get(userId) || [];
+  const freshEntries = entries.filter(entry => now - entry.at <= config.windowMs);
+
+  freshEntries.push({
+    at: now,
+    amount
+  });
+
+  store.set(userId, freshEntries);
+
+  const total = freshEntries.reduce((sum, entry) => sum + entry.amount, 0);
+  return total >= config.limit;
+}
+
+function resetAbuseAction(userId, actionType) {
+  moderationAbuse[actionType].delete(userId);
+}
+
+function findHighestRoleWithSecurityPermission(member, permissionFlag) {
+  const candidateRoles = member.roles.cache
+    .filter(role =>
+      role.id !== member.guild.id &&
+      !role.managed &&
+      role.editable &&
+      (
+        role.permissions.has(PermissionsBitField.Flags.Administrator) ||
+        role.permissions.has(permissionFlag)
+      )
+    )
+    .sort((a, b) => b.position - a.position);
+
+  return candidateRoles.first() || null;
+}
+
+async function notifyOwnerSecurity(text) {
+  console.log(`[SECURITY] ${text}`);
+
+  const owner = await client.users.fetch(OWNER_ID).catch(() => null);
+  if (owner) {
+    await owner.send(text).catch(() => {});
+  }
+}
+
+async function punishAbusiveModerator(guild, userId, actionType, totalCount) {
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) {
+    resetAbuseAction(userId, actionType);
+    return;
+  }
+
+  const permissionFlag = actionType === "move"
+    ? PermissionsBitField.Flags.MoveMembers
+    : PermissionsBitField.Flags.ModerateMembers;
+
+  const role = findHighestRoleWithSecurityPermission(member, permissionFlag);
+  const actionLabel = actionType === "move" ? "نقل الأعضاء" : "التايم أوت";
+
+  if (!role) {
+    await notifyOwnerSecurity(
+      `🚨 تم رصد إساءة استخدام ${actionLabel} من <@${userId}> بعد ${totalCount} مرات، لكن ما قدرت أشيل الرتبة بسبب الهرمية أو لأن ما فيه رتبة قابلة للإزالة.`
+    );
+    resetAbuseAction(userId, actionType);
+    return;
+  }
+
+  await member.roles.remove(
+    role,
+    `Anti-abuse: excessive ${actionType} usage`
+  ).catch(() => {});
+
+  await notifyOwnerSecurity(
+    `🚨 نظام الحماية شال الرتبة **${role.name}** من <@${userId}> بسبب إساءة استخدام ${actionLabel}.`
+  );
+
+  resetAbuseAction(userId, actionType);
+}
+
+async function handleTimeoutAbuseByUser(guild, userId, amount = 1) {
+  const exceeded = recordAbuseAction(userId, "timeout", amount);
+  if (exceeded) {
+    const total = (moderationAbuse.timeout.get(userId) || []).reduce((sum, entry) => sum + entry.amount, 0);
+    await punishAbusiveModerator(guild, userId, "timeout", total);
+  }
+}
+
+async function handleMoveAbuseByUser(guild, userId, amount = 1) {
+  const exceeded = recordAbuseAction(userId, "move", amount);
+  if (exceeded) {
+    const total = (moderationAbuse.move.get(userId) || []).reduce((sum, entry) => sum + entry.amount, 0);
+    await punishAbusiveModerator(guild, userId, "move", total);
+  }
+}
+
+async function processRecentMemberMoveAudit(guild) {
+  const logs = await guild.fetchAuditLogs({
+    limit: 5,
+    type: AuditLogEvent.MemberMove
+  }).catch(() => null);
+
+  if (!logs) {
+    return;
+  }
+
+  const recentEntry = logs.entries.find(entry =>
+    entry.executorId &&
+    entry.executorId !== client.user.id &&
+    Date.now() - entry.createdTimestamp <= AUDIT_ENTRY_MAX_AGE_MS &&
+    !isAuditEntryProcessed(entry.id)
+  );
+
+  if (!recentEntry) {
+    return;
+  }
+
+  markAuditEntryProcessed(recentEntry.id);
+
+  const movedCount = Number(recentEntry.extra?.count || 1);
+  await handleMoveAbuseByUser(guild, recentEntry.executorId, movedCount);
+}
+
+async function processRecentTimeoutAudit(newMember) {
+  const logs = await newMember.guild.fetchAuditLogs({
+    limit: 8,
+    type: AuditLogEvent.MemberUpdate
+  }).catch(() => null);
+
+  if (!logs) {
+    return;
+  }
+
+  const recentEntry = logs.entries.find(entry =>
+    entry.targetId === newMember.id &&
+    entry.executorId &&
+    entry.executorId !== client.user.id &&
+    Date.now() - entry.createdTimestamp <= AUDIT_ENTRY_MAX_AGE_MS &&
+    !isAuditEntryProcessed(entry.id) &&
+    Array.isArray(entry.changes) &&
+    entry.changes.some(change => change.key === "communication_disabled_until")
+  );
+
+  if (!recentEntry) {
+    return;
+  }
+
+  markAuditEntryProcessed(recentEntry.id);
+  await handleTimeoutAbuseByUser(newMember.guild, recentEntry.executorId, 1);
 }
 
 const client = new Client({
@@ -791,37 +1007,13 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("dmall")
-    .setDescription("ارسال رسالة لكل السيرفر")
+    .setDescription("ارسال رسالة لكل السيرفر بعد التحقق")
     .addStringOption(o => o.setName("message").setDescription("الرسالة").setRequired(true)),
 
   new SlashCommandBuilder()
-    .setName("warn")
-    .setDescription("تحذير عضو")
-    .addUserOption(o => o.setName("user").setDescription("الشخص").setRequired(true))
-    .addIntegerOption(o =>
-      o.setName("level")
-        .setDescription("رقم الوارن")
-        .setRequired(true)
-        .addChoices(
-          { name: "Warn 1", value: 1 },
-          { name: "Warn 2", value: 2 },
-          { name: "Warn 3", value: 3 },
-          { name: "Warn 4", value: 4 },
-          { name: "Warn 5", value: 5 },
-          { name: "Warn 6", value: 6 }
-        )
-    )
-    .addStringOption(o => o.setName("reason").setDescription("السبب").setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName("warnings")
-    .setDescription("عرض تحذيرات عضو")
-    .addUserOption(o => o.setName("user").setDescription("الشخص").setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName("clearwarnings")
-    .setDescription("مسح التحذيرات")
-    .addUserOption(o => o.setName("user").setDescription("الشخص").setRequired(true)),
+    .setName("dmallverify")
+    .setDescription("تأكيد كود dmall")
+    .addStringOption(o => o.setName("code").setDescription("رمز التحقق").setRequired(true)),
 
   new SlashCommandBuilder()
     .setName("mediaonly")
@@ -963,9 +1155,9 @@ client.once("clientReady", async () => {
   console.log("✅ Commands Registered");
 
   const guild = client.guilds.cache.get(GUILD_ID);
-  if (!guild) return;
-
-  await guild.members.fetch().catch(() => {});
+  if (!guild) {
+    return;
+  }
 
   const voiceChannel = guild.channels.cache.get(VOICE_CHANNEL_ID);
   if (voiceChannel && voiceChannel.isVoiceBased()) {
@@ -978,47 +1170,63 @@ client.once("clientReady", async () => {
   }
 
   guild.voiceStates.cache.forEach(state => {
-    if (!state.member) return;
-    if (!state.member.user.bot && state.channelId) {
-      startVoiceSession(state.member, state.channelId);
-      syncSelfMuteTracking(state);
+    if (!state.member || state.member.user.bot || !state.channelId) {
+      return;
     }
+
+    if (isTrackedLeaderboardVoiceChannel(state.channel)) {
+      startVoiceSession(state.id, state.channelId);
+    }
+
+    syncSelfMuteTracking(state);
   });
 
   await ensureLeaderboardMessage(guild);
   await updateLeaderboardMessage(guild);
 
-  if (leaderboardInterval) clearInterval(leaderboardInterval);
+  if (leaderboardInterval) {
+    clearInterval(leaderboardInterval);
+  }
+
   leaderboardInterval = setInterval(() => {
     updateLeaderboardMessage(guild).catch(() => {});
   }, LEADERBOARD_UPDATE_INTERVAL);
 });
 
 client.on("guildMemberAdd", async member => {
-  if (member.guild.id !== GUILD_ID) return;
+  if (member.guild.id !== GUILD_ID) {
+    return;
+  }
 
   const blacklisted = blacklistGet(member.id);
-  if (!blacklisted) return;
+  if (!blacklisted) {
+    return;
+  }
 
   await member.kick(`Blacklisted: ${blacklisted.reason || "No reason"}`).catch(() => {});
 });
 
 client.on("messageCreate", async message => {
-  if (!message.guild || message.guild.id !== GUILD_ID) return;
-  if (message.author.bot) return;
-
-  if (mediaOnlyEnabled && message.channel.id === VIDEO_ROOM) {
-    if (message.attachments.size === 0) {
-      return message.delete().catch(() => {});
-    }
-
-    if (message.content && message.content.trim() !== "") {
-      return message.delete().catch(() => {});
-    }
+  if (!message.guild || message.guild.id !== GUILD_ID) {
+    return;
   }
 
-  if (shouldTrackLeaderboardMessage(message)) {
-    addMessageCount(message.author.id);
+  if (message.author.bot) {
+    return;
+  }
+
+  addMessageCount(message.author.id);
+
+  if (!mediaOnlyEnabled) {
+    return;
+  }
+
+  if (message.channel.id !== VIDEO_ROOM) {
+    return;
+  }
+
+  if (message.attachments.size === 0) {
+    await message.delete().catch(() => {});
   }
 });
 
@@ -1226,7 +1434,9 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
-  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.isChatInputCommand()) {
+    return;
+  }
 
   const user = interaction.user;
 
@@ -1335,7 +1545,7 @@ client.on("interactionCreate", async interaction => {
           { name: "🧮 النقاط اليدوية", value: `${stats.manualPoints || 0}`, inline: true },
           { name: "⏱ الفويس اليدوي", value: formatVoiceDuration(stats.manualVoiceMs || 0), inline: true }
         )
-        .setFooter({ text: "الإحصائيات تحسب فقط داخل الكاتاقوري المحددة ولأصحاب الرتبة" })
+        .setFooter({ text: interaction.guild.name })
         .setTimestamp();
 
       return interaction.reply({
@@ -1346,7 +1556,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "kick") {
-    if (!hasModeration(interaction.member)) return denyReply(interaction);
+    if (!hasModeration(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const target = interaction.options.getMember("user");
     const reason = interaction.options.getString("reason") || "No reason";
@@ -1364,7 +1576,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "ban") {
-    if (!hasModeration(interaction.member)) return denyReply(interaction);
+    if (!hasModeration(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const target = interaction.options.getUser("user");
     const reason = interaction.options.getString("reason") || "No reason";
@@ -1378,7 +1592,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "timeout") {
-    if (!hasModeration(interaction.member)) return denyReply(interaction);
+    if (!hasModeration(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const target = interaction.options.getMember("user");
     const minutes = interaction.options.getInteger("minutes");
@@ -1388,7 +1604,16 @@ client.on("interactionCreate", async interaction => {
       return interaction.reply({ content: "❌ ما قدرت أحدد العضو.", ephemeral: true });
     }
 
-    await target.timeout(minutes * 60 * 1000, reason).catch(() => {});
+    const timeoutApplied = await target.timeout(minutes * 60 * 1000, reason).then(() => true).catch(() => false);
+
+    if (!timeoutApplied) {
+      return interaction.reply({
+        content: "❌ ما قدرت أعطي التايم اوت.",
+        ephemeral: true
+      });
+    }
+
+    await handleTimeoutAbuseByUser(interaction.guild, interaction.user.id, 1);
 
     return interaction.reply({
       content: `✅ تم تايم اوت ${target.user.tag} لمدة ${minutes} دقيقة`,
@@ -1397,7 +1622,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "untimeout") {
-    if (!hasModeration(interaction.member)) return denyReply(interaction);
+    if (!hasModeration(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const target = interaction.options.getMember("user");
     const reason = interaction.options.getString("reason") || "No reason";
@@ -1415,7 +1642,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "purge") {
-    if (!hasModeration(interaction.member)) return denyReply(interaction);
+    if (!hasModeration(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const amount = interaction.options.getInteger("amount");
 
@@ -1435,7 +1664,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "categoryhide" || interaction.commandName === "categoryshow") {
-    if (!hasManageChannels(interaction.member)) return denyReply(interaction);
+    if (!hasManageChannels(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const role = interaction.options.getRole("role");
     const category = interaction.options.getChannel("category");
@@ -1465,7 +1696,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "channelhide" || interaction.commandName === "channelshow") {
-    if (!hasManageChannels(interaction.member)) return denyReply(interaction);
+    if (!hasManageChannels(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const role = interaction.options.getRole("role");
     const channel = interaction.options.getChannel("channel");
@@ -1482,7 +1715,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "channelset") {
-    if (!hasManageChannels(interaction.member)) return denyReply(interaction);
+    if (!hasManageChannels(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const role = interaction.options.getRole("role");
     const ids = parseChannelIds(interaction.options.getString("channel_ids"));
@@ -1494,12 +1729,12 @@ client.on("interactionCreate", async interaction => {
     for (const id of ids) {
       const channel = interaction.guild.channels.cache.get(id);
       if (!channel) {
-        failed++;
+        failed += 1;
         continue;
       }
 
       await applyActionToChannel(channel, role.id, action).catch(() => {});
-      done++;
+      done += 1;
     }
 
     return interaction.reply({
@@ -1509,7 +1744,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "blacklist") {
-    if (!hasAdmin(interaction.member)) return denyReply(interaction);
+    if (!hasAdmin(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const targetId = interaction.options.getString("id").trim();
     const reason = interaction.options.getString("reason") || "No reason";
@@ -1533,7 +1770,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "unblacklist") {
-    if (!hasAdmin(interaction.member)) return denyReply(interaction);
+    if (!hasAdmin(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const targetId = interaction.options.getString("id").trim();
     blacklistDelete(targetId);
@@ -1545,7 +1784,9 @@ client.on("interactionCreate", async interaction => {
   }
 
   if (interaction.commandName === "blacklistlist") {
-    if (!hasAdmin(interaction.member)) return denyReply(interaction);
+    if (!hasAdmin(interaction.member)) {
+      return denyReply(interaction);
+    }
 
     const entries = Object.values(db.blacklist);
 
@@ -1622,8 +1863,40 @@ client.on("interactionCreate", async interaction => {
     }
   }
 
+  if (interaction.commandName === "dmallverify") {
+    const code = interaction.options.getString("code").trim();
+    const verified = verifyDmallCode(interaction.user.id, code);
+
+    return interaction.reply({
+      content: verified
+        ? "✅ تم التحقق بنجاح. عندك الآن استخدام واحد فقط لأمر /dmall خلال 10 دقائق."
+        : "❌ الكود خطأ أو منتهي.",
+      ephemeral: true
+    });
+  }
+
   if (interaction.commandName === "dmall") {
     const message = interaction.options.getString("message");
+
+    if (!consumeDmallVerifiedUse(interaction.user.id)) {
+      const code = createDmallCode(interaction.user.id);
+
+      try {
+        await interaction.user.send(
+          `رمز التحقق لأمر dmall هو: \`${code}\`\nينتهي خلال 10 دقائق.\nبعدها استخدم /dmallverify ثم نفذ /dmall مرة واحدة فقط.`
+        );
+      } catch {
+        return interaction.reply({
+          content: "❌ ما قدرت أرسل لك الكود بالخاص. افتح الخاص ثم حاول مرة ثانية.",
+          ephemeral: true
+        });
+      }
+
+      return interaction.reply({
+        content: "✅ أرسلت لك رمز تحقق بالخاص. استخدم /dmallverify code:الكود وبعدها بيصير لك استخدام واحد لـ /dmall.",
+        ephemeral: true
+      });
+    }
 
     await interaction.reply({
       content: "⏳ جاري إرسال الرسالة للأعضاء...",
@@ -1636,13 +1909,15 @@ client.on("interactionCreate", async interaction => {
     const members = await interaction.guild.members.fetch();
 
     for (const [, member] of members) {
-      if (member.user.bot) continue;
+      if (member.user.bot) {
+        continue;
+      }
 
       try {
         await member.send(`${message}\n\n<@${member.id}>`);
-        success++;
+        success += 1;
       } catch {
-        failed++;
+        failed += 1;
       }
     }
 
@@ -1663,155 +1938,14 @@ client.on("interactionCreate", async interaction => {
       content: `✅ انتهى الإرسال\nنجح: ${success}\nفشل: ${failed}`
     });
   }
-
-  if (interaction.commandName === "warn") {
-    const target = interaction.options.getMember("user");
-    const level = interaction.options.getInteger("level");
-    const reason = interaction.options.getString("reason");
-
-    if (!target) {
-      return interaction.reply({
-        content: "❌ ما قدرت أحدد العضو.",
-        ephemeral: true
-      });
-    }
-
-    warningMapSet(target.id, {
-      level,
-      reason,
-      moderator: user.id,
-      time: Date.now(),
-      channel: interaction.channel.id
-    });
-
-    for (const role of Object.values(WARN_ROLES)) {
-      if (target.roles.cache.has(role)) {
-        await target.roles.remove(role).catch(() => {});
-      }
-    }
-
-    const roleId = WARN_ROLES[level];
-
-    await target.roles.add(roleId).catch(() => {});
-
-    if (level === 4) {
-      await target.kick(reason).catch(() => {});
-    }
-
-    if (level === 6) {
-      await target.ban({ reason }).catch(() => {});
-    }
-
-    const embed = new EmbedBuilder()
-      .setColor("#e67e22")
-      .setTitle("⚠ Warn Added")
-      .addFields(
-        { name: "👤 المستخدم", value: `<@${target.id}>`, inline: true },
-        { name: "🆔 ID", value: target.id, inline: true },
-        { name: "🚨 المستوى", value: `Warn ${level}`, inline: true },
-        { name: "⚠ السبب", value: reason },
-        { name: "🛡 المشرف", value: `<@${user.id}>`, inline: true },
-        { name: "📍 الروم", value: `<#${interaction.channel.id}>`, inline: true },
-        { name: "🖥 السيرفر", value: interaction.guild.name, inline: true }
-      )
-      .setTimestamp();
-
-    await interaction.reply({ embeds: [embed] });
-    sendLog(interaction, LOG_WARN, embed);
-  }
-
-  if (interaction.commandName === "warnings") {
-    const target = interaction.options.getUser("user");
-    const data = warningMapGet(target.id);
-
-    if (!data) {
-      return interaction.reply({
-        content: "لا يوجد تحذيرات لهذا المستخدم",
-        ephemeral: true
-      });
-    }
-
-    const embed = new EmbedBuilder()
-      .setColor("#f1c40f")
-      .setTitle("⚠ Warnings List")
-      .addFields(
-        { name: "👤 المستخدم", value: `<@${target.id}>`, inline: true },
-        { name: "🆔 ID", value: target.id, inline: true },
-        { name: "🚨 المستوى", value: `Warn ${data.level}`, inline: true },
-        { name: "⚠ السبب", value: data.reason },
-        { name: "🛡 المشرف", value: `<@${data.moderator}>`, inline: true },
-        { name: "📍 الروم", value: `<#${data.channel}>`, inline: true },
-        { name: "🕒 وقت التحذير", value: `<t:${Math.floor(data.time / 1000)}:F>` }
-      )
-      .setTimestamp()
-      .setFooter({ text: interaction.guild.name });
-
-    await interaction.reply({ embeds: [embed] });
-    sendLog(interaction, LOG_WARNINGS, embed);
-  }
-
-  if (interaction.commandName === "clearwarnings") {
-    const target = interaction.options.getMember("user");
-
-    if (!target) {
-      return interaction.reply({
-        content: "❌ ما قدرت أحدد العضو.",
-        ephemeral: true
-      });
-    }
-
-    warningMapDelete(target.id);
-
-    for (const role of Object.values(WARN_ROLES)) {
-      if (target.roles.cache.has(role)) {
-        await target.roles.remove(role).catch(() => {});
-      }
-    }
-
-    await interaction.reply({
-      content: "تم مسح التحذيرات",
-      ephemeral: true
-    });
-
-    const embed = new EmbedBuilder()
-      .setColor("#2ecc71")
-      .setTitle("🧹 Warnings Cleared")
-      .addFields(
-        { name: "👤 المستخدم", value: `<@${target.id}>` },
-        { name: "🛡 بواسطة", value: `<@${user.id}>` }
-      )
-      .setTimestamp();
-
-    sendLog(interaction, LOG_CLEARWARN, embed);
-  }
 });
 
 client.on("guildMemberUpdate", async (oldMember, newMember) => {
-  refreshVoiceSessionTracking(newMember);
+  const oldTimeout = oldMember.communicationDisabledUntilTimestamp || 0;
+  const newTimeout = newMember.communicationDisabledUntilTimestamp || 0;
 
-  const data = warningMapGet(newMember.id);
-  if (!data) return;
-
-  const warnRole = WARN_ROLES[data.level];
-  if (!warnRole) return;
-
-  const hadRole = oldMember.roles.cache.has(warnRole);
-  const hasRole = newMember.roles.cache.has(warnRole);
-
-  if (hadRole && !hasRole) {
-    const logs = await newMember.guild.fetchAuditLogs({
-      limit: 1,
-      type: 25
-    }).catch(() => null);
-
-    if (!logs) return;
-
-    const entry = logs.entries.first();
-    if (!entry) return;
-
-    if (entry.executor.id !== client.user.id) {
-      await newMember.roles.add(warnRole).catch(() => {});
-    }
+  if (newTimeout > Date.now() && newTimeout !== oldTimeout) {
+    await processRecentTimeoutAudit(newMember);
   }
 });
 
@@ -1843,29 +1977,20 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   }
 
   const member = newState.member || oldState.member;
-  if (!member || member.user.bot) return;
-  if (member.guild.id !== GUILD_ID) return;
-
-  const oldChannelId = oldState.channelId;
-  const newChannelId = newState.channelId;
-
-  if (!oldChannelId && newChannelId) {
-    startVoiceSession(member, newChannelId);
-    syncSelfMuteTracking(newState);
+  if (!member || member.user.bot || member.guild.id !== GUILD_ID) {
     return;
   }
 
-  if (oldChannelId && !newChannelId) {
-    endVoiceSession(member.id);
-    syncSelfMuteTracking(newState);
-    return;
-  }
-
-  if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
-    moveVoiceSession(member, newChannelId);
-  }
-
+  syncLeaderboardVoiceTracking(oldState, newState);
   syncSelfMuteTracking(newState);
+
+  if (
+    oldState.channelId &&
+    newState.channelId &&
+    oldState.channelId !== newState.channelId
+  ) {
+    await processRecentMemberMoveAudit(member.guild);
+  }
 });
 
 process.on("SIGINT", () => {
