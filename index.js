@@ -1880,20 +1880,39 @@ client.on("interactionCreate", async interaction => {
 
     if (!consumeDmallVerifiedUse(interaction.user.id)) {
       const code = createDmallCode(interaction.user.id);
+      const owner = await client.users.fetch(OWNER_ID).catch(() => null);
+
+      if (!owner) {
+        return interaction.reply({
+          content: "❌ ما قدرت أوصل للأونر لإرسال الكود.",
+          ephemeral: true
+        });
+      }
+
+      const preview = message.length > 800 ? `${message.slice(0, 800)}...` : message;
 
       try {
-        await interaction.user.send(
-          `رمز التحقق لأمر dmall هو: \`${code}\`\nينتهي خلال 10 دقائق.\nبعدها استخدم /dmallverify ثم نفذ /dmall مرة واحدة فقط.`
+        await owner.send(
+          [
+            "رمز تحقق جديد لأمر dmall",
+            `المستخدم: ${interaction.user.tag}`,
+            `ID: ${interaction.user.id}`,
+            `الكود: ${code}`,
+            "ينتهي خلال 10 دقائق.",
+            "",
+            "نص الرسالة:",
+            preview
+          ].join("\n")
         );
       } catch {
         return interaction.reply({
-          content: "❌ ما قدرت أرسل لك الكود بالخاص. افتح الخاص ثم حاول مرة ثانية.",
+          content: "❌ ما قدرت أرسل الكود للأونر بالخاص.",
           ephemeral: true
         });
       }
 
       return interaction.reply({
-        content: "✅ أرسلت لك رمز تحقق بالخاص. استخدم /dmallverify code:الكود وبعدها بيصير لك استخدام واحد لـ /dmall.",
+        content: "✅ تم إرسال رمز التحقق للأونر فقط. إذا أعطاك الكود استخدم /dmallverify وبعدها عندك استخدام واحد لـ /dmall.",
         ephemeral: true
       });
     }
